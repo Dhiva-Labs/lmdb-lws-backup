@@ -1,0 +1,28 @@
+# Oneshot backup cycle, triggered by lmdb-lws-backup.timer.
+# This is the recommended deployment mode.
+[Unit]
+Description=Encrypted hot backup of the monero-lws LMDB database
+Documentation=https://github.com/Dhiva-Labs/lmdb-lws-backup
+
+[Service]
+Type=oneshot
+User=monero-lws
+Group=monero-lws
+# Key file contains: LWS_BACKUP_KEY=<base64 32-byte key>  (chmod 600 root:root)
+EnvironmentFile=/etc/lmdb-lws-backup/key.env
+ExecStart=/usr/local/bin/lmdb-lws-backup --config /etc/lmdb-lws-backup/config.toml --once
+
+# Hardening. ReadWritePaths must include the destination, the log, and the
+# source DB directory — LMDB needs write access to lock.mdb even for
+# read-only transactions (reader-slot registration).
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/monero-lws/.bitmonero/light_wallet_server
+ReadWritePaths=/var/backups/monero-lws /var/log/lmdb-lws-backup.log
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes

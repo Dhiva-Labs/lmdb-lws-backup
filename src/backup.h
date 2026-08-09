@@ -42,7 +42,7 @@ VerifyResult verify_backup_file(const Config& cfg, const std::string& enc_path,
 
 // Decrypts a backup to <to_path>/data.mdb (plain LMDB subdir env layout),
 // then sanity-opens it. Refuses to overwrite an existing data.mdb.
-VerifyResult restore_backup(const Config& cfg, const std::string& enc_path,
+VerifyResult restore_backup(const std::string& enc_path,
                             const std::string& to_path, const SecretKey& key);
 
 // "YYYYMMDD" in the configured timezone (used for backup filenames).

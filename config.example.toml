@@ -1,0 +1,39 @@
+# lmdb-lws-backup configuration
+# Copy to /etc/lmdb-lws-backup/config.toml and adjust.
+
+[source]
+# monero-lws database directory (its --db-path). The service user needs
+# read access to data.mdb and WRITE access to lock.mdb (LMDB registers
+# read-transaction slots in the lock file).
+db_path = "/home/monero-lws/.bitmonero/light_wallet_server"
+
+[backup]
+destination_dir = "/var/backups/monero-lws"
+retention_days = 30
+# schedule_time/timezone are only used in --daemon mode; ignored by --once.
+schedule_time = "03:00"          # HH:MM, one run per day
+timezone = "UTC"                 # "UTC", "local", or an IANA name like "Asia/Kolkata"
+# chunk_size = 1048576           # encryption chunk (bytes); default 1 MiB
+
+[encryption]
+# Exactly one of key_env_var / key_file must be set.
+# The key is 32 bytes, base64-encoded. Generate one with:
+#   head -c 32 /dev/urandom | base64
+key_env_var = "LWS_BACKUP_KEY"
+# key_file = "/etc/lmdb-lws-backup/backup.key"   # must be chmod 600
+
+# [verify]
+# By default the post-backup verify decrypts into anonymous RAM (memfd).
+# Only set this if the machine lacks RAM for a full decrypted copy AND you
+# accept transient plaintext on the given filesystem (file is unlinked
+# before use, but bytes touch the device):
+# scratch_dir = "/encrypted-scratch"
+
+[logging]
+log_path = "/var/log/lmdb-lws-backup.log"
+level = "info"                   # debug | info | warn | error
+
+[alerting]
+# POSTs a small JSON payload (stage, error, host, timestamp) on backup or
+# verify failure. Requires the curl binary. Empty/omitted = disabled.
+on_failure_webhook = ""

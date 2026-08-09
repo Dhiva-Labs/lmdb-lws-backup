@@ -1,0 +1,31 @@
+# Alternative to the timer: the tool's internal scheduler (--daemon).
+# Use this only where systemd timers are unavailable; otherwise prefer
+# lmdb-lws-backup.timer + lmdb-lws-backup.service.
+[Unit]
+Description=Encrypted hot backup daemon for the monero-lws LMDB database
+Documentation=https://github.com/Dhiva-Labs/lmdb-lws-backup
+After=network.target
+
+[Service]
+Type=simple
+User=monero-lws
+Group=monero-lws
+EnvironmentFile=/etc/lmdb-lws-backup/key.env
+ExecStart=/usr/local/bin/lmdb-lws-backup --config /etc/lmdb-lws-backup/config.toml --daemon
+Restart=on-failure
+RestartSec=30
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=tmpfs
+BindPaths=/home/monero-lws/.bitmonero/light_wallet_server
+ReadWritePaths=/var/backups/monero-lws /var/log/lmdb-lws-backup.log
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

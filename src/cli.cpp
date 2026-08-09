@@ -288,7 +288,7 @@ int cmd_list(const Config& cfg) {
 int cmd_restore(const Config& cfg, const std::string& file,
                 const std::string& to) {
   SecretKey key = load_key(cfg);
-  VerifyResult vr = restore_backup(cfg, file, to, key);
+  VerifyResult vr = restore_backup(file, to, key);
   std::printf("restored %s -> %s/data.mdb\n", file.c_str(), to.c_str());
   std::printf("  accounts: %llu, total rows: %llu\n",
               static_cast<unsigned long long>(vr.accounts.account_count),

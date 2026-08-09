@@ -141,7 +141,7 @@ VerifyResult verify_backup_file(const Config& cfg, const std::string& enc_path,
   return res;
 }
 
-VerifyResult restore_backup(const Config& cfg, const std::string& enc_path,
+VerifyResult restore_backup(const std::string& enc_path,
                             const std::string& to_path, const SecretKey& key) {
   fs::create_directories(to_path);
   fs::permissions(to_path, fs::perms::owner_all,
