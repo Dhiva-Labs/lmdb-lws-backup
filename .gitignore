@@ -1,0 +1,4 @@
+build/
+third_party/local/
+third_party/libsodium-1.0.20/
+third_party/libsodium-*.tar.gz
