@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <unistd.h>
 
+#include <fstream>
 #include <stdexcept>
 
 #include "test_util.h"
@@ -113,6 +114,67 @@ void test_reader_check_clean() {
   CHECK(reader_check(g_src.get()) == 0);
 }
 
+void test_resolve_env_path() {
+  namespace fs = std::filesystem;
+
+  const std::string dir = g_tmp->sub("resolve");
+  fs::create_directory(dir);
+  {
+    Env writer = Env::open_readwrite(dir, 4, kMapSize, false);
+    put_kv(writer.get(), "t1", "row", "subdir");
+  }
+  CHECK(resolve_env_path(dir) == dir);
+
+  // data.mdb beside lock.mdb must open the env directory: no private
+  // data.mdb-lock may appear, or a live writer would not see our reader.
+  const std::string data = dir + "/data.mdb";
+  CHECK(fs::exists(dir + "/lock.mdb"));
+  CHECK(resolve_env_path(data) == dir);
+  {
+    Env env = Env::open_readonly(data, 4);
+    CHECK(get_kv(env.get(), "t1", "row") == "subdir");
+  }
+  CHECK(!fs::exists(data + "-lock"));
+
+  // A lone data.mdb (e.g. mdb_copy output) is a single-file env.
+  const std::string bare = g_tmp->sub("bare");
+  fs::create_directory(bare);
+  fs::copy_file(data, bare + "/data.mdb");
+  CHECK(resolve_env_path(bare + "/data.mdb") == bare + "/data.mdb");
+  {
+    Env env = Env::open_readonly(bare + "/data.mdb", 4);
+    CHECK(get_kv(env.get(), "t1", "row") == "subdir");
+  }
+
+  const std::string single = g_tmp->sub("single.mdb");
+  {
+    Env writer = Env::open_readwrite(single, 4, kMapSize, true);
+    put_kv(writer.get(), "t1", "row", "single-file");
+  }
+  CHECK(resolve_env_path(single) == single);
+  {
+    Env env = Env::open_readonly(single, 4);
+    CHECK(get_kv(env.get(), "t1", "row") == "single-file");
+  }
+
+  const std::string missing = g_tmp->sub("missing/data.mdb");
+  CHECK(resolve_env_path(missing) == missing);
+  CHECK_THROWS(Env::open_readonly(missing, 4));
+
+  // Traces of BOTH lock protocols: a data.mdb whose directory has lock.mdb
+  // AND a sibling data.mdb-lock. The writer could be subdir-mode or
+  // single-file-mode; redirecting on a stale lock.mdb would register our
+  // reader where a single-file writer never looks (torn snapshot). The
+  // resolver must refuse rather than guess.
+  const std::string ambi = g_tmp->sub("ambiguous");
+  fs::create_directory(ambi);
+  fs::copy_file(data, ambi + "/data.mdb");
+  { std::ofstream(ambi + "/lock.mdb") << ""; }
+  { std::ofstream(ambi + "/data.mdb-lock") << ""; }
+  CHECK_THROWS(resolve_env_path(ambi + "/data.mdb"));
+  CHECK_THROWS(Env::open_readonly(ambi + "/data.mdb", 4));
+}
+
 }  // namespace
 
 int main() {
@@ -125,6 +187,7 @@ int main() {
   RUN(test_copy_to_file_and_reopen);
   RUN(test_failed_copy_releases_and_source_survives);
   RUN(test_reader_check_clean);
+  RUN(test_resolve_env_path);
 
   g_src.reset();
   return test_exit();

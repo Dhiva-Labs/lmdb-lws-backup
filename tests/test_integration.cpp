@@ -8,6 +8,12 @@
 //   - retention prunes pre-seeded old backups correctly
 //   - --verify detects a corrupted file
 //   - --restore produces a walkable plain LMDB env
+//   - a non-lws (generic) env backs up, verifies and restores under a custom
+//     filename_prefix, with a manifest that carries no account fields
+//   - single-file (MDB_NOSUBDIR) envs holding only main-DB data back up
+//   - a db_path naming <env>/data.mdb is redirected to the env directory
+//     instead of opening data.mdb with a second, invisible lock file
+//   - profile = "monero-lws" against a non-lws env fails and leaves nothing
 //   - --daemon shuts down cleanly on SIGTERM
 
 #include <fcntl.h>
@@ -19,6 +25,7 @@
 #include <atomic>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -42,6 +49,17 @@ std::string g_binary;
 std::string g_config_path;
 std::string g_src_dir;
 std::string g_dest_dir;
+
+// Second, non-lws environment shared by the generic-profile tests.
+constexpr int kGenericUsers = 40;
+constexpr int kGenericSessions = 25;
+constexpr int kGenericEvents = 10;
+constexpr int kGenericRows = kGenericUsers + kGenericSessions + kGenericEvents;
+constexpr int kGenericTables = 3;
+const char kGenericPrefix[] = "appdb";
+std::string g_generic_dir;
+std::string g_generic_dest;
+std::string g_generic_config;
 
 Env g_src;
 std::vector<LwsAccount> g_accounts;  // shadow copies for dupsort updates
@@ -103,6 +121,37 @@ void build_synthetic_env() {
   mdb_check(mdb_txn_commit(txn), "commit");
 }
 
+// ---- synthetic generic (non-lws) environments ----------------------------
+
+// `table` == nullptr writes into the unnamed main DB.
+void put_plain_rows(MDB_txn* txn, const char* table, int count) {
+  const char* label = table ? table : "main";
+  MDB_dbi dbi;
+  mdb_check(mdb_dbi_open(txn, table, table ? MDB_CREATE : 0u, &dbi), label);
+  for (int i = 0; i < count; ++i) {
+    std::string key = std::string(label) + "-key-" + std::to_string(i);
+    std::string val = std::string(label) + "-value-" + std::to_string(i);
+    MDB_val k{key.size(), key.data()};
+    MDB_val v{val.size(), val.data()};
+    mdb_check(mdb_put(txn, dbi, &k, &v, 0), label);
+  }
+}
+
+// Application-style env: three plain named tables, nothing lws-shaped.
+void build_generic_env() {
+  g_generic_dir = g_tmp->sub("app-db");
+  g_generic_dest = g_tmp->sub("app-backups");
+  std::filesystem::create_directory(g_generic_dir);
+
+  Env env = Env::open_readwrite(g_generic_dir, 8, 32u << 20, false);
+  MDB_txn* txn = nullptr;
+  mdb_check(mdb_txn_begin(env.get(), nullptr, 0, &txn), "txn");
+  put_plain_rows(txn, "users", kGenericUsers);
+  put_plain_rows(txn, "sessions", kGenericSessions);
+  put_plain_rows(txn, "events", kGenericEvents);
+  mdb_check(mdb_txn_commit(txn), "commit");
+}
+
 // Continuously bumps scan heights and appends output rows, the way the live
 // scanner thread does.
 void writer_loop() {
@@ -147,8 +196,9 @@ void writer_loop() {
 
 // ---- subprocess driver ----------------------------------------------------
 
-int run_tool(const std::vector<std::string>& extra_args,
-             std::string* output = nullptr, int timeout_sec = 120) {
+int run_tool_cfg(const std::string& config_path,
+                 const std::vector<std::string>& extra_args,
+                 std::string* output = nullptr, int timeout_sec = 120) {
   std::string out_path = g_tmp->sub("tool-output.txt");
   pid_t pid = fork();
   if (pid == 0) {
@@ -159,7 +209,7 @@ int run_tool(const std::vector<std::string>& extra_args,
     argv.push_back(const_cast<char*>(g_binary.c_str()));
     std::string cfg_flag = "--config";
     argv.push_back(const_cast<char*>(cfg_flag.c_str()));
-    argv.push_back(const_cast<char*>(g_config_path.c_str()));
+    argv.push_back(const_cast<char*>(config_path.c_str()));
     for (const auto& a : extra_args) argv.push_back(const_cast<char*>(a.c_str()));
     argv.push_back(nullptr);
     execv(g_binary.c_str(), argv.data());
@@ -186,15 +236,29 @@ int run_tool(const std::vector<std::string>& extra_args,
   return WIFEXITED(status) ? WEXITSTATUS(status) : -2;
 }
 
-void write_config() {
-  g_config_path = g_tmp->sub("config.toml");
-  std::ofstream f(g_config_path);
-  f << "[source]\ndb_path = \"" << g_src_dir << "\"\n"
-    << "[backup]\ndestination_dir = \"" << g_dest_dir << "\"\n"
-    << "retention_days = 30\nschedule_time = \"03:00\"\ntimezone = \"UTC\"\n"
+int run_tool(const std::vector<std::string>& extra_args,
+             std::string* output = nullptr, int timeout_sec = 120) {
+  return run_tool_cfg(g_config_path, extra_args, output, timeout_sec);
+}
+
+// Empty `prefix` / `profile` leave the key out so the tool's defaults apply.
+void write_config_file(const std::string& path, const std::string& db_path,
+                       const std::string& dest, const std::string& prefix,
+                       const std::string& profile) {
+  std::ofstream f(path);
+  f << "[source]\ndb_path = \"" << db_path << "\"\n";
+  if (!profile.empty()) f << "profile = \"" << profile << "\"\n";
+  f << "[backup]\ndestination_dir = \"" << dest << "\"\n";
+  if (!prefix.empty()) f << "filename_prefix = \"" << prefix << "\"\n";
+  f << "retention_days = 30\nschedule_time = \"03:00\"\ntimezone = \"UTC\"\n"
     << "chunk_size = 65536\n"
     << "[encryption]\nkey_env_var = \"LWSBK_ITEST_KEY\"\n"
     << "[logging]\nlevel = \"info\"\n";
+}
+
+void write_config() {
+  g_config_path = g_tmp->sub("config.toml");
+  write_config_file(g_config_path, g_src_dir, g_dest_dir, "", "");
 }
 
 std::string today_utc() {
@@ -325,6 +389,218 @@ void test_list() {
   CHECK(out.find(std::to_string(kNumAccounts)) != std::string::npos);
 }
 
+std::string read_text_file(const std::string& path) {
+  std::ifstream f(path);
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+// Entry names in `dir`; empty when the directory does not exist.
+std::vector<std::string> dir_names(const std::string& dir) {
+  std::vector<std::string> names;
+  std::error_code ec;
+  for (const auto& de : std::filesystem::directory_iterator(dir, ec))
+    names.push_back(de.path().filename().string());
+  return names;
+}
+
+void test_generic_env_backup() {
+  build_generic_env();
+  g_generic_config = g_tmp->sub("generic.toml");
+  write_config_file(g_generic_config, g_generic_dir, g_generic_dest,
+                    kGenericPrefix, "");
+
+  std::string out;
+  int rc = run_tool_cfg(g_generic_config, {"--once"}, &out);
+  CHECK_MSG(rc == 0, "generic backup failed (rc=%d):\n%s", rc, out.c_str());
+
+  const std::string today = today_utc();
+  const std::string enc_name =
+      std::string(kGenericPrefix) + "-" + today + ".lmdbbak.enc";
+  const std::string man_name =
+      std::string(kGenericPrefix) + "-" + today + ".manifest.json";
+  int enc_files = 0;
+  for (const std::string& name : dir_names(g_generic_dest)) {
+    if (name.ends_with(".lmdbbak.enc")) {
+      ++enc_files;
+      CHECK_MSG(name == enc_name, "unexpected backup name: %s", name.c_str());
+    } else {
+      CHECK_MSG(name == man_name, "unexpected file in destination: %s",
+                name.c_str());
+    }
+  }
+  CHECK_MSG(enc_files == 1, "expected exactly one backup, found %d", enc_files);
+
+  auto backups = scan_backups(g_generic_dest, kGenericPrefix);
+  CHECK(backups.size() == 1);
+  if (backups.size() != 1) return;
+  CHECK(backups[0].date == today);
+  CHECK(backups[0].manifest_path.has_value());
+  if (!backups[0].manifest_path) return;
+
+  Manifest m = read_manifest_file(*backups[0].manifest_path);
+  CHECK_MSG(m.profile == "generic", "manifest profile '%s'",
+            m.profile.c_str());
+  CHECK(m.total_rows && *m.total_rows == kGenericRows);
+  CHECK(m.table_count && *m.table_count == kGenericTables);
+  CHECK(m.account_count == 0);
+  CHECK(!m.scan_height_min && !m.scan_height_max);
+  CHECK(sha256_file_hex(backups[0].enc_path) == m.sha256_of_encrypted_file);
+
+  const std::string json = read_text_file(*backups[0].manifest_path);
+  CHECK_MSG(json.find("account_count") == std::string::npos,
+            "generic manifest carries account fields:\n%s", json.c_str());
+  CHECK(json.find("scan_height") == std::string::npos);
+
+  rc = run_tool_cfg(g_generic_config, {"--verify", backups[0].enc_path}, &out);
+  CHECK_MSG(rc == 0, "generic verify failed:\n%s", out.c_str());
+  CHECK_MSG(out.find("generic") != std::string::npos,
+            "verify output does not name the generic profile:\n%s",
+            out.c_str());
+}
+
+void test_generic_singlefile_env() {
+  constexpr int kRows = 17;
+  const std::string dir = g_tmp->sub("single-db");
+  const std::string file = dir + "/state.mdb";
+  const std::string dest = g_tmp->sub("single-backups");
+  const std::string prefix = "single";
+  std::filesystem::create_directory(dir);
+  {
+    Env env = Env::open_readwrite(file, 4, 32u << 20, true);
+    MDB_txn* txn = nullptr;
+    mdb_check(mdb_txn_begin(env.get(), nullptr, 0, &txn), "txn");
+    put_plain_rows(txn, nullptr, kRows);  // main DB only, no named tables
+    mdb_check(mdb_txn_commit(txn), "commit");
+  }
+  CHECK(std::filesystem::is_regular_file(file));
+
+  const std::string cfg = g_tmp->sub("single.toml");
+  write_config_file(cfg, file, dest, prefix, "");
+  std::string out;
+  int rc = run_tool_cfg(cfg, {"--once"}, &out);
+  CHECK_MSG(rc == 0, "single-file backup failed (rc=%d):\n%s", rc,
+            out.c_str());
+
+  auto backups = scan_backups(dest, prefix);
+  CHECK(backups.size() == 1);
+  if (backups.size() != 1) return;
+  CHECK(backups[0].manifest_path.has_value());
+  if (!backups[0].manifest_path) return;
+
+  Manifest m = read_manifest_file(*backups[0].manifest_path);
+  CHECK_MSG(m.profile == "generic", "manifest profile '%s'",
+            m.profile.c_str());
+  CHECK(m.total_rows && *m.total_rows == kRows);
+  CHECK(m.table_count && *m.table_count == 0);
+}
+
+void test_data_mdb_path_guard() {
+  const std::string split_lock = g_src_dir + "/data.mdb-lock";
+  CHECK(std::filesystem::exists(g_src_dir + "/lock.mdb"));
+  CHECK(!std::filesystem::exists(split_lock));
+
+  const std::string dest = g_tmp->sub("guard-backups");
+  const std::string cfg = g_tmp->sub("guard.toml");
+  write_config_file(cfg, g_src_dir + "/data.mdb", dest, "", "");
+
+  std::string out;
+  int rc = run_tool_cfg(cfg, {"--once"}, &out);
+  CHECK_MSG(rc == 0, "backup via data.mdb path failed (rc=%d):\n%s", rc,
+            out.c_str());
+  CHECK_MSG(reader_count(g_src.get()) == 0, "leaked reader slot");
+
+  // Opening data.mdb directly would have created this second lock file,
+  // invisible to the live writer, and read the env without its protection.
+  CHECK_MSG(!std::filesystem::exists(split_lock),
+            "data.mdb was opened directly: %s exists", split_lock.c_str());
+
+  auto backups = scan_backups(dest);
+  CHECK(backups.size() == 1);
+  if (backups.size() != 1) return;
+  CHECK(backups[0].manifest_path.has_value());
+  if (!backups[0].manifest_path) return;
+
+  Manifest m = read_manifest_file(*backups[0].manifest_path);
+  CHECK_MSG(m.profile == "monero-lws", "manifest profile '%s'",
+            m.profile.c_str());
+  CHECK_MSG(m.account_count == kNumAccounts, "manifest count %llu",
+            static_cast<unsigned long long>(m.account_count));
+}
+
+void test_forced_profile_mismatch() {
+  const std::string dest = g_tmp->sub("mismatch-backups");
+  const std::string cfg = g_tmp->sub("mismatch.toml");
+  write_config_file(cfg, g_generic_dir, dest, "", "monero-lws");
+
+  std::string out;
+  int rc = run_tool_cfg(cfg, {"--once"}, &out);
+  CHECK_MSG(rc != 0, "forced monero-lws profile accepted a generic env:\n%s",
+            out.c_str());
+  CHECK_MSG(out.find("accounts table missing") != std::string::npos,
+            "unexpected failure reason:\n%s", out.c_str());
+
+  // No ciphertext, partial or manifest may survive a failed cycle.
+  for (const std::string& name : dir_names(dest)) {
+    CHECK_MSG(name.find(".lmdbbak") == std::string::npos &&
+                  name.find(".manifest") == std::string::npos,
+              "failed cycle left %s behind", name.c_str());
+  }
+}
+
+void test_generic_restore() {
+  auto backups = scan_backups(g_generic_dest, kGenericPrefix);
+  CHECK(backups.size() == 1);
+  if (backups.size() != 1) return;
+
+  const std::string to = g_tmp->sub("generic-restored");
+  std::string out;
+  int rc = run_tool_cfg(g_generic_config,
+                        {"--restore", backups[0].enc_path, "--to", to}, &out);
+  CHECK_MSG(rc == 0, "generic restore failed:\n%s", out.c_str());
+  CHECK(std::filesystem::exists(to + "/data.mdb"));
+
+  Env restored = Env::open_readonly(to, 32);
+  ReadTxn txn(restored.get());
+  TableWalk w = walk_tables_generic(txn.get());
+  CHECK_MSG(w.table_count == kGenericTables, "restored tables %llu",
+            static_cast<unsigned long long>(w.table_count));
+  CHECK_MSG(w.total_rows() == kGenericRows, "restored rows %llu",
+            static_cast<unsigned long long>(w.total_rows()));
+  CHECK(w.main_db_rows == 0);
+  CHECK(!w.has_lws_accounts);
+}
+
+void test_restore_profile_mismatch_cleans_up() {
+  // Restoring a generic backup under a pinned monero-lws profile must fail
+  // AFTER decryption — and must then remove the decrypted plaintext so the
+  // target stays clean and a corrected retry is not blocked by the
+  // overwrite check.
+  auto backups = scan_backups(g_generic_dest, kGenericPrefix);
+  CHECK(backups.size() == 1);
+  if (backups.size() != 1) return;
+
+  const std::string to = g_tmp->sub("mismatch-restored");
+  std::string out;
+  int rc = run_tool_cfg(g_generic_config,
+                        {"--profile", "monero-lws", "--restore",
+                         backups[0].enc_path, "--to", to},
+                        &out);
+  CHECK_MSG(rc != 0, "restore accepted a forced-profile mismatch:\n%s",
+            out.c_str());
+  CHECK_MSG(!std::filesystem::exists(to + "/data.mdb"),
+            "failed restore left decrypted data.mdb behind");
+  CHECK(!std::filesystem::exists(to + "/lock.mdb"));
+
+  // The corrected retry into the SAME directory must now succeed.
+  rc = run_tool_cfg(g_generic_config,
+                    {"--restore", backups[0].enc_path, "--to", to}, &out);
+  CHECK_MSG(rc == 0, "retry after cleaned-up mismatch failed:\n%s",
+            out.c_str());
+  CHECK(std::filesystem::exists(to + "/data.mdb"));
+}
+
 void test_daemon_sigterm() {
   pid_t pid = fork();
   if (pid == 0) {
@@ -385,6 +661,12 @@ int main(int argc, char** argv) {
   RUN(test_retention_prunes_preseeded);
   RUN(test_restore);
   RUN(test_list);
+  RUN(test_generic_env_backup);
+  RUN(test_generic_singlefile_env);
+  RUN(test_data_mdb_path_guard);
+  RUN(test_forced_profile_mismatch);
+  RUN(test_generic_restore);
+  RUN(test_restore_profile_mismatch_cleans_up);
   RUN(test_daemon_sigterm);
 
   g_writer_stop.store(true);

@@ -2,13 +2,20 @@
 # Copy to /etc/lmdb-lws-backup/config.toml and adjust.
 
 [source]
-# monero-lws database directory (its --db-path). The service user needs
-# read access to data.mdb and WRITE access to lock.mdb (LMDB registers
-# read-transaction slots in the lock file).
+# LMDB environment directory to back up (here: monero-lws's --db-path).
+# The service user needs read access to data.mdb and WRITE access to
+# lock.mdb (LMDB registers read-transaction slots in the lock file).
 db_path = "/home/monero-lws/.bitmonero/light_wallet_server"
+# Verify/manifest detail: auto (monero-lws if its accounts table exists, else
+# generic) | monero-lws (accounts table required) | generic (schema-blind).
+# profile = "auto"
+# Max named sub-databases the tool opens (1..4096); raise it if verify says so.
+# max_named_dbs = 128
 
 [backup]
 destination_dir = "/var/backups/monero-lws"
+# Files are named <filename_prefix>-YYYYMMDD.lmdbbak.enc (+ .manifest.json).
+# filename_prefix = "lws-backup"
 retention_days = 30
 # schedule_time/timezone are only used in --daemon mode; ignored by --once.
 schedule_time = "03:00"          # HH:MM, one run per day

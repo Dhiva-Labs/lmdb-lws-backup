@@ -10,8 +10,11 @@ namespace lwsbk {
 struct Config {
   // [source]
   std::string db_path = "/home/monero-lws/.bitmonero/light_wallet_server";
+  std::string profile = "auto";  // "auto", "monero-lws" or "generic"
+  unsigned max_named_dbs = 128;  // LMDB named sub-DB limit, 1..4096
   // [backup]
   std::string destination_dir = "/var/backups/monero-lws";
+  std::string filename_prefix = "lws-backup";  // <prefix>-YYYYMMDD.*
   int retention_days = 30;
   std::string schedule_time = "03:00";  // --daemon only
   std::string timezone = "UTC";         // "UTC", "local", or an IANA name

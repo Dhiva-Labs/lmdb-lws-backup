@@ -12,22 +12,39 @@ namespace fs = std::filesystem;
 
 namespace lwsbk {
 
-std::string backup_filename_for_date(const std::string& yyyymmdd) {
-  return std::string(kBackupPrefix) + yyyymmdd + kBackupSuffix;
+namespace {
+
+// The 8 characters between "<prefix>-" and `suffix` when `name` is exactly
+// <prefix>-XXXXXXXX<suffix>; the characters are not checked to be digits.
+std::optional<std::string> dated_name_field(const std::string& name,
+                                            const std::string& prefix,
+                                            const char* suffix) {
+  const size_t plen = prefix.size() + 1;  // prefix + the inserted dash
+  const size_t slen = std::strlen(suffix);
+  if (name.size() != plen + 8 + slen) return std::nullopt;
+  if (name.compare(0, prefix.size(), prefix) != 0) return std::nullopt;
+  if (name[prefix.size()] != '-') return std::nullopt;
+  if (name.compare(plen + 8, slen, suffix) != 0) return std::nullopt;
+  return name.substr(plen, 8);
 }
 
-std::string manifest_filename_for_date(const std::string& yyyymmdd) {
-  return std::string(kBackupPrefix) + yyyymmdd + kManifestSuffix;
+}  // namespace
+
+std::string backup_filename_for_date(const std::string& yyyymmdd,
+                                     const std::string& prefix) {
+  return prefix + "-" + yyyymmdd + kBackupSuffix;
 }
 
-std::optional<std::string> parse_backup_date(const std::string& filename) {
-  const size_t plen = std::strlen(kBackupPrefix);
-  const size_t slen = std::strlen(kBackupSuffix);
-  if (filename.size() != plen + 8 + slen) return std::nullopt;
-  if (filename.compare(0, plen, kBackupPrefix) != 0) return std::nullopt;
-  if (filename.compare(plen + 8, slen, kBackupSuffix) != 0) return std::nullopt;
-  std::string date = filename.substr(plen, 8);
-  for (char c : date)
+std::string manifest_filename_for_date(const std::string& yyyymmdd,
+                                       const std::string& prefix) {
+  return prefix + "-" + yyyymmdd + kManifestSuffix;
+}
+
+std::optional<std::string> parse_backup_date(const std::string& filename,
+                                             const std::string& prefix) {
+  auto date = dated_name_field(filename, prefix, kBackupSuffix);
+  if (!date) return std::nullopt;
+  for (char c : *date)
     if (c < '0' || c > '9') return std::nullopt;
   return date;
 }
@@ -48,16 +65,18 @@ std::string yyyymmdd_minus_days(const std::string& yyyymmdd, int days) {
   return buf;
 }
 
-std::vector<BackupEntry> scan_backups(const std::string& dir) {
+std::vector<BackupEntry> scan_backups(const std::string& dir,
+                                      const std::string& prefix) {
   std::vector<BackupEntry> out;
   for (const auto& de : fs::directory_iterator(dir)) {
     if (!de.is_regular_file()) continue;
-    auto date = parse_backup_date(de.path().filename().string());
+    auto date = parse_backup_date(de.path().filename().string(), prefix);
     if (!date) continue;
     BackupEntry e;
     e.enc_path = de.path().string();
     e.date = *date;
-    fs::path manifest = de.path().parent_path() / manifest_filename_for_date(*date);
+    fs::path manifest =
+        de.path().parent_path() / manifest_filename_for_date(*date, prefix);
     if (fs::exists(manifest)) e.manifest_path = manifest.string();
     out.push_back(std::move(e));
   }
@@ -88,8 +107,9 @@ std::vector<BackupEntry> plan_deletions(const std::vector<BackupEntry>& sorted_a
 }
 
 int apply_retention(const std::string& dir, int retention_days,
-                    const std::string& today_yyyymmdd) {
-  auto backups = scan_backups(dir);
+                    const std::string& today_yyyymmdd,
+                    const std::string& prefix) {
+  auto backups = scan_backups(dir, prefix);
   auto doomed = plan_deletions(backups, retention_days, today_yyyymmdd);
   int removed = 0;
   for (const BackupEntry& e : doomed) {
@@ -131,18 +151,16 @@ int cleanup_partials(const std::string& dir) {
   return removed;
 }
 
-int cleanup_orphan_manifests(const std::string& dir) {
+int cleanup_orphan_manifests(const std::string& dir,
+                             const std::string& prefix) {
   int removed = 0;
-  const size_t plen = std::strlen(kBackupPrefix);
-  const size_t slen = std::strlen(kManifestSuffix);
   for (const auto& de : fs::directory_iterator(dir)) {
     if (!de.is_regular_file()) continue;
     const std::string name = de.path().filename().string();
-    if (name.size() != plen + 8 + slen) continue;
-    if (name.compare(0, plen, kBackupPrefix) != 0) continue;
-    if (name.compare(plen + 8, slen, kManifestSuffix) != 0) continue;
-    const std::string date = name.substr(plen, 8);
-    fs::path enc = de.path().parent_path() / backup_filename_for_date(date);
+    auto date = dated_name_field(name, prefix, kManifestSuffix);
+    if (!date) continue;
+    fs::path enc =
+        de.path().parent_path() / backup_filename_for_date(*date, prefix);
     if (!fs::exists(enc)) {
       std::error_code ec;
       if (fs::remove(de.path(), ec) && !ec) {

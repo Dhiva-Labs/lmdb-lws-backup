@@ -8,7 +8,8 @@
 
 // RAII wrappers around the LMDB C API plus the hot-copy primitive.
 //
-// Safety contract with the live monero-lws process:
+// Safety contract with the live writer process (monero-lws or any other
+// LMDB application):
 //   - the source env is only ever opened MDB_RDONLY,
 //   - mdb_env_set_mapsize is never called on it,
 //   - every transaction is guaranteed to be aborted on every exit path
@@ -33,6 +34,18 @@ inline void mdb_check(int rc, const char* what) {
   if (rc != MDB_SUCCESS) throw LmdbError(rc, what);
 }
 
+// Maps an operator-supplied database path to the path LMDB must open.
+// A data.mdb with a lock.mdb beside it belongs to a subdirectory env, so its
+// directory is returned: opening the file itself (MDB_NOSUBDIR) would make
+// LMDB use a separate "data.mdb-lock" that the live writer never consults —
+// our reader slot would be invisible to it, and it could recycle pages under
+// our read transaction (a torn snapshot). Directories, other regular files
+// (single-file envs) and paths that cannot be stat()ed are returned as-is.
+// When BOTH lock.mdb and data.mdb-lock exist the layout is ambiguous — the
+// writer could be using either lock protocol — and this throws instead of
+// guessing, telling the operator to remove the stale lock file.
+std::string resolve_env_path(const std::string& path);
+
 // Move-only owner of an MDB_env.
 class Env {
  public:
@@ -50,9 +63,10 @@ class Env {
   ~Env() { reset(); }
 
   // Opens an existing environment read-only, auto-detecting whether `path`
-  // is a subdirectory env (data.mdb inside) or a single-file env
-  // (MDB_NOSUBDIR). Never resizes the map. `no_lock` must only be used for
-  // private scratch copies that no other process can possibly have open.
+  // (after resolve_env_path) is a subdirectory env (data.mdb inside) or a
+  // single-file env (MDB_NOSUBDIR). Never resizes the map. `no_lock` must
+  // only be used for private scratch copies that no other process can
+  // possibly have open.
   static Env open_readonly(const std::string& path, unsigned max_dbs,
                            bool no_lock = false);
 

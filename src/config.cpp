@@ -37,6 +37,32 @@ void read_value(const toml::table* tbl, const char* key, T& out,
   }
 }
 
+constexpr unsigned kMaxNamedDbsLimit = 4096;
+constexpr std::size_t kMaxPrefixLen = 100;
+
+bool is_prefix_char(char c) {
+  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+         (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-';
+}
+
+void validate_filename_prefix(const std::string& p) {
+  if (p.empty())
+    throw std::runtime_error("config: filename_prefix must not be empty");
+  if (p.size() > kMaxPrefixLen)
+    throw std::runtime_error("config: filename_prefix must be at most " +
+                             std::to_string(kMaxPrefixLen) + " characters");
+  if (p[0] == '.' || p[0] == '-')
+    throw std::runtime_error(
+        "config: filename_prefix must not start with '.' or '-', got '" + p +
+        "'");
+  for (char c : p)
+    if (!is_prefix_char(c))
+      throw std::runtime_error(
+          "config: filename_prefix may contain only letters, digits, '.', '_' "
+          "and '-', got '" +
+          p + "'");
+}
+
 }  // namespace
 
 Config load_config(const std::string& path) {
@@ -56,15 +82,26 @@ Config load_config(const std::string& path) {
                      "alerting"});
 
   const toml::table* source = root["source"].as_table();
-  if (source) warn_unknown_keys(*source, "source", {"db_path"});
+  if (source)
+    warn_unknown_keys(*source, "source",
+                      {"db_path", "profile", "max_named_dbs"});
   read_value<std::string>(source, "db_path", cfg.db_path, "source");
+  read_value<std::string>(source, "profile", cfg.profile, "source");
+  int64_t named_dbs = cfg.max_named_dbs;
+  read_value<int64_t>(source, "max_named_dbs", named_dbs, "source");
+  if (named_dbs < 1 || named_dbs > static_cast<int64_t>(kMaxNamedDbsLimit))
+    throw std::runtime_error("config: [source] max_named_dbs must be in 1.." +
+                             std::to_string(kMaxNamedDbsLimit));
+  cfg.max_named_dbs = static_cast<unsigned>(named_dbs);
 
   const toml::table* backup = root["backup"].as_table();
   if (backup)
     warn_unknown_keys(*backup, "backup",
                       {"destination_dir", "retention_days", "schedule_time",
-                       "timezone", "chunk_size"});
+                       "timezone", "chunk_size", "filename_prefix"});
   read_value<std::string>(backup, "destination_dir", cfg.destination_dir,
+                          "backup");
+  read_value<std::string>(backup, "filename_prefix", cfg.filename_prefix,
                           "backup");
   int64_t retention = cfg.retention_days;
   read_value<int64_t>(backup, "retention_days", retention, "backup");
@@ -104,6 +141,15 @@ Config load_config(const std::string& path) {
 void validate_config(const Config& cfg) {
   if (cfg.db_path.empty())
     throw std::runtime_error("config: source db_path must not be empty");
+  if (cfg.profile != "auto" && cfg.profile != "monero-lws" &&
+      cfg.profile != "generic")
+    throw std::runtime_error(
+        "config: profile must be one of auto, monero-lws, generic — got '" +
+        cfg.profile + "'");
+  if (cfg.max_named_dbs < 1 || cfg.max_named_dbs > kMaxNamedDbsLimit)
+    throw std::runtime_error("config: max_named_dbs must be in 1.." +
+                             std::to_string(kMaxNamedDbsLimit));
+  validate_filename_prefix(cfg.filename_prefix);
   if (cfg.destination_dir.empty())
     throw std::runtime_error("config: backup destination_dir must not be empty");
   if (cfg.retention_days < 1 || cfg.retention_days > 3650)

@@ -4,6 +4,7 @@
 
 #include <cctype>
 #include <cstring>
+#include <filesystem>
 
 #include "log.h"
 
@@ -22,9 +23,40 @@ struct stat stat_or_throw(const std::string& path) {
 
 }  // namespace
 
+std::string resolve_env_path(const std::string& path) {
+  struct stat st;
+  if (::stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) return path;
+  const std::filesystem::path p(path);
+  if (p.filename().string() != "data.mdb") return path;
+  std::string dir = p.parent_path().string();
+  if (dir.empty()) dir = ".";
+  struct stat lock_st;
+  const bool subdir_lock = ::stat((dir + "/lock.mdb").c_str(), &lock_st) == 0;
+  const bool file_lock = ::stat((path + "-lock").c_str(), &lock_st) == 0;
+  if (subdir_lock && file_lock) {
+    // Traces of both lock protocols: a subdirectory-env writer would use
+    // lock.mdb, a single-file writer of this data.mdb would use
+    // data.mdb-lock. Guessing wrong registers our reader in a lock file the
+    // live writer never reads, and the snapshot can be torn mid-copy.
+    // Refuse and make the operator resolve the ambiguity.
+    throw std::runtime_error(
+        "ambiguous LMDB layout: both " + dir + "/lock.mdb and " + path +
+        "-lock exist, so it is unclear whether the live writer opened the "
+        "directory environment or the data.mdb file directly; delete the "
+        "stale lock file (the one no running process holds open), or set "
+        "db_path to the directory if this is a subdirectory environment");
+  }
+  if (subdir_lock) return dir;
+  return path;
+}
+
 Env Env::open_readonly(const std::string& path, unsigned max_dbs,
                        bool no_lock) {
-  struct stat st = stat_or_throw(path);
+  const std::string env_path = resolve_env_path(path);
+  if (env_path != path)
+    LWSBK_DEBUG("%s is the data file of a subdirectory env; opening %s",
+                path.c_str(), env_path.c_str());
+  struct stat st = stat_or_throw(env_path);
   // MDB_NOTLS: reader slots bind to transaction objects instead of threads,
   // so RAII abort releases the slot immediately and mdb_env_copyfd2 can run
   // its own read transaction while we hold one. Purely local bookkeeping —
@@ -33,8 +65,8 @@ Env Env::open_readonly(const std::string& path, unsigned max_dbs,
   if (S_ISREG(st.st_mode)) {
     flags |= MDB_NOSUBDIR;
   } else if (!S_ISDIR(st.st_mode)) {
-    throw std::runtime_error("database path is neither a file nor a directory: " +
-                             path);
+    throw std::runtime_error(
+        "database path is neither a file nor a directory: " + env_path);
   }
   if (no_lock) flags |= MDB_NOLOCK;
 
@@ -46,7 +78,7 @@ Env Env::open_readonly(const std::string& path, unsigned max_dbs,
   // Deliberately no mdb_env_set_mapsize: an existing env is mapped at the
   // size persisted in its meta page, and this tool must never resize the
   // live database.
-  mdb_check(mdb_env_open(raw, path.c_str(), flags, 0600), "mdb_env_open");
+  mdb_check(mdb_env_open(raw, env_path.c_str(), flags, 0600), "mdb_env_open");
   return env;
 }
 

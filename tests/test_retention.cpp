@@ -136,6 +136,84 @@ void test_apply_retention_filesystem() {
   CHECK(scan_backups(dir).size() == 30);
 }
 
+void test_custom_prefix_naming() {
+  CHECK(backup_filename_for_date("20260810", "mydb") ==
+        "mydb-20260810.lmdbbak.enc");
+  CHECK(manifest_filename_for_date("20260810", "mydb") ==
+        "mydb-20260810.manifest.json");
+  CHECK(backup_filename_for_date("20260810") ==
+        backup_filename_for_date("20260810", kDefaultBackupPrefix));
+  CHECK(manifest_filename_for_date("20260810") ==
+        "lws-backup-20260810.manifest.json");
+
+  CHECK(parse_backup_date("mydb-20260810.lmdbbak.enc", "mydb") == "20260810");
+  CHECK(parse_backup_date(backup_filename_for_date("20260810", "my-db"),
+                          "my-db") == "20260810");
+  CHECK(!parse_backup_date("mydb-20260810.lmdbbak.enc.partial", "mydb"));
+  CHECK(!parse_backup_date("mydb-2026081x.lmdbbak.enc", "mydb"));
+  CHECK(!parse_backup_date("mydb-20260810.manifest.json", "mydb"));
+  CHECK(!parse_backup_date("mydb_20260810.lmdbbak.enc", "mydb"));  // dash
+
+  // Each prefix is invisible to the other, including a prefix that is only
+  // the leading part of the real one.
+  CHECK(!parse_backup_date("mydb-20260810.lmdbbak.enc"));
+  CHECK(!parse_backup_date("lws-backup-20260810.lmdbbak.enc", "mydb"));
+  CHECK(!parse_backup_date("lws-backup-20260810.lmdbbak.enc", "lws"));
+  CHECK(!parse_backup_date("my-db-20260810.lmdbbak.enc", "my"));
+}
+
+void test_custom_prefix_filesystem() {
+  const std::string dir = g_tmp->sub("dest_prefix");
+  std::filesystem::create_directory(dir);
+  // Two interleaved series of 33 consecutive dailies with manifests.
+  for (int i = 0; i < 33; ++i) {
+    std::string d = yyyymmdd_minus_days("20260810", i);
+    for (const char* p : {"lws-backup", "mydb"}) {
+      touch(dir + "/" + backup_filename_for_date(d, p));
+      touch(dir + "/" + manifest_filename_for_date(d, p));
+    }
+  }
+  CHECK(scan_backups(dir).size() == 33);
+  CHECK(scan_backups(dir, "mydb").size() == 33);
+
+  // Pruning the custom series leaves the default series untouched.
+  CHECK(apply_retention(dir, 30, "20260810", "mydb") == 3);
+  CHECK(scan_backups(dir).size() == 33);
+  auto mine = scan_backups(dir, "mydb");
+  CHECK(mine.size() == 30);
+  CHECK(mine.front().date == "20260712");
+  CHECK(mine.back().date == "20260810");
+  for (const auto& e : mine) {
+    CHECK(e.manifest_path.has_value());
+    CHECK(e.enc_path.find("/mydb-") != std::string::npos);
+  }
+  for (const char* d : {"20260709", "20260710", "20260711"}) {
+    CHECK(!std::filesystem::exists(dir + "/" +
+                                   backup_filename_for_date(d, "mydb")));
+    CHECK(!std::filesystem::exists(dir + "/" +
+                                   manifest_filename_for_date(d, "mydb")));
+    CHECK(std::filesystem::exists(dir + "/" + backup_filename_for_date(d)));
+    CHECK(std::filesystem::exists(dir + "/" + manifest_filename_for_date(d)));
+  }
+
+  // And the default series prunes without touching the custom one.
+  CHECK(apply_retention(dir, 30, "20260810") == 3);
+  CHECK(scan_backups(dir).size() == 30);
+  CHECK(scan_backups(dir, "mydb").size() == 30);
+
+  // Orphan manifest cleanup is scoped to the given prefix as well.
+  touch(dir + "/" + manifest_filename_for_date("20200101", "mydb"));
+  touch(dir + "/" + manifest_filename_for_date("20200101"));
+  CHECK(cleanup_orphan_manifests(dir, "mydb") == 1);
+  CHECK(std::filesystem::exists(dir + "/" +
+                                manifest_filename_for_date("20200101")));
+  CHECK(cleanup_orphan_manifests(dir) == 1);
+  CHECK(!std::filesystem::exists(dir + "/" +
+                                 manifest_filename_for_date("20200101")));
+  CHECK(scan_backups(dir).size() == 30);
+  CHECK(scan_backups(dir, "mydb").size() == 30);
+}
+
 }  // namespace
 
 int main() {
@@ -151,6 +229,8 @@ int main() {
   RUN(test_same_day_rerun_stable);
   RUN(test_defensive_bounds);
   RUN(test_apply_retention_filesystem);
+  RUN(test_custom_prefix_naming);
+  RUN(test_custom_prefix_filesystem);
 
   return test_exit();
 }

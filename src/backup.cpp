@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 
@@ -23,8 +24,6 @@ namespace fs = std::filesystem;
 namespace lwsbk {
 
 namespace {
-
-constexpr unsigned kMaxDbs = 128;
 
 [[noreturn]] void throw_errno(const std::string& what) {
   throw std::runtime_error(what + ": " + std::strerror(errno));
@@ -86,16 +85,89 @@ int make_scratch_fd(const Config& cfg) {
       "plaintext on");
 }
 
-VerifyResult walk_scratch_env(int scratch_fd) {
+// Counts the named tables among the main DB's keys by probing each with
+// mdb_dbi_open: a plain data key fails with MDB_INCOMPATIBLE and takes no
+// handle slot, so a large unnamed main DB does not inflate the count.
+// Keys with an embedded NUL are plain data, as in walk_tables_generic.
+// nullopt when the env's handle slots run out before the walk ends.
+std::optional<uint64_t> count_named_tables(MDB_txn* txn) {
+  MDB_dbi main_dbi;
+  mdb_check(mdb_dbi_open(txn, nullptr, 0, &main_dbi), "open main DB");
+  Cursor cur(txn, main_dbi);
+  uint64_t n = 0;
+  MDB_val k{}, v{};
+  int rc = mdb_cursor_get(cur.get(), &k, &v, MDB_FIRST);
+  while (rc == MDB_SUCCESS) {
+    const std::string name(static_cast<const char*>(k.mv_data), k.mv_size);
+    MDB_dbi dbi;
+    int orc = name.find('\0') != std::string::npos
+                  ? MDB_INCOMPATIBLE
+                  : mdb_dbi_open(txn, name.c_str(), 0, &dbi);
+    if (orc == MDB_SUCCESS)
+      ++n;
+    else if (orc == MDB_DBS_FULL)
+      return std::nullopt;
+    else if (orc != MDB_INCOMPATIBLE && orc != MDB_NOTFOUND)
+      throw LmdbError(orc, "cannot open table '" + name + "'");
+    rc = mdb_cursor_get(cur.get(), &k, &v, MDB_NEXT);
+  }
+  if (rc != MDB_NOTFOUND) throw LmdbError(rc, "cursor walk of main DB failed");
+  return n;
+}
+
+// LMDB fixes how many named tables one env handle can open at mdb_env_open
+// time, so a database with more tables than [source] max_named_dbs is
+// reopened with room for all of them.
+Env open_env_adaptive(const std::string& path, unsigned base_max_dbs,
+                      bool no_lock) {
+  unsigned slots = base_max_dbs;
+  Env env = Env::open_readonly(path, slots, no_lock);
+  // Slots left by a crashed run must be cleared before the probe below can
+  // claim one of its own.
+  if (!no_lock) reader_check(env.get());
+  for (;;) {
+    std::optional<uint64_t> tables;
+    {
+      ReadTxn txn(env.get());
+      tables = count_named_tables(txn.get());
+    }
+    if (tables && *tables + 4 <= slots) return env;
+    slots = tables ? static_cast<unsigned>(*tables + 16) : slots * 2;
+    LWSBK_DEBUG("reopening %s with room for %u named tables", path.c_str(),
+                slots);
+    // Close before reopening: two handles on one env within a process
+    // break LMDB's fcntl-based locking.
+    env.reset();
+    env = Env::open_readonly(path, slots, no_lock);
+  }
+}
+
+// The generic walk always runs, so every table is read end to end whatever
+// the profile; monero-lws adds the strict accounts walk on top.
+VerifyResult walk_env(const Config& cfg, MDB_txn* txn) {
+  const TableWalk w = walk_tables_generic(txn);
+  if (cfg.profile == "monero-lws" && !w.has_lws_accounts)
+    throw std::runtime_error(
+        "profile monero-lws but accounts table missing — set [source] "
+        "profile to \"auto\" or \"generic\" to back up other LMDB databases");
   VerifyResult res;
+  if (cfg.profile == "auto")
+    res.profile = w.has_lws_accounts ? "monero-lws" : "generic";
+  else
+    res.profile = cfg.profile;
+  if (res.profile == "monero-lws") res.accounts = walk_accounts(txn);
+  res.table_count = w.table_count;
+  res.total_rows = w.total_rows();
+  return res;
+}
+
+VerifyResult walk_scratch_env(const Config& cfg, int scratch_fd) {
   std::string path = "/proc/self/fd/" + std::to_string(scratch_fd);
   // no_lock: the scratch inode is private to this process, and a "-lock"
   // sibling path cannot exist under /proc.
-  Env env = Env::open_readonly(path, kMaxDbs, /*no_lock=*/true);
+  Env env = open_env_adaptive(path, cfg.max_named_dbs, /*no_lock=*/true);
   ReadTxn txn(env.get());
-  res.accounts = walk_accounts(txn.get());
-  res.total_rows = walk_all_tables(txn.get());
-  return res;
+  return walk_env(cfg, txn.get());
 }
 
 void fsync_dir(const std::string& dir) {
@@ -135,13 +207,13 @@ VerifyResult verify_backup_file(const Config& cfg, const std::string& enc_path,
   StreamResult dr = decrypt_fd_stream(in, scratch.fd, key, abort_requested);
   in_guard.reset();
 
-  VerifyResult res = walk_scratch_env(scratch.fd);
+  VerifyResult res = walk_scratch_env(cfg, scratch.fd);
   res.plaintext_bytes = dr.plaintext_bytes;
   res.sha256_hex = to_hex(dr.sha256, sizeof(dr.sha256));
   return res;
 }
 
-VerifyResult restore_backup(const std::string& enc_path,
+VerifyResult restore_backup(const Config& cfg, const std::string& enc_path,
                             const std::string& to_path, const SecretKey& key) {
   fs::create_directories(to_path);
   fs::permissions(to_path, fs::perms::owner_all,
@@ -157,8 +229,9 @@ VerifyResult restore_backup(const std::string& enc_path,
   if (out < 0) throw_errno("cannot create " + data.string());
   FdGuard out_guard(out);
 
+  StreamResult dr;
   try {
-    decrypt_fd_stream(in, out, key, nullptr);
+    dr = decrypt_fd_stream(in, out, key, nullptr);
     if (fsync(out) != 0) throw_errno("fsync " + data.string());
   } catch (...) {
     out_guard.reset();
@@ -168,12 +241,21 @@ VerifyResult restore_backup(const std::string& enc_path,
   out_guard.reset();
   in_guard.reset();
 
-  // Sanity-open the restored environment and summarize it.
+  // Sanity-open the restored environment and summarize it. If this fails —
+  // including a forced-profile mismatch — remove the decrypted plaintext
+  // again: a failed restore must not leave key material behind, and the
+  // leftover would block a corrected retry on the overwrite check above.
   VerifyResult res;
-  Env env = Env::open_readonly(to_path, kMaxDbs);
-  ReadTxn txn(env.get());
-  res.accounts = walk_accounts(txn.get());
-  res.total_rows = walk_all_tables(txn.get());
+  try {
+    Env env = open_env_adaptive(to_path, cfg.max_named_dbs, /*no_lock=*/false);
+    ReadTxn txn(env.get());
+    res = walk_env(cfg, txn.get());
+  } catch (...) {
+    ::unlink(data.c_str());
+    ::unlink((fs::path(to_path) / "lock.mdb").c_str());
+    throw;
+  }
+  res.plaintext_bytes = dr.plaintext_bytes;
   res.sha256_hex = sha256_file_hex(enc_path);
   return res;
 }
@@ -191,17 +273,19 @@ BackupOutcome run_backup_cycle(const Config& cfg, const SecretKey& key,
                cfg.destination_dir.c_str());
   }
   cleanup_partials(cfg.destination_dir);
-  cleanup_orphan_manifests(cfg.destination_dir);
+  cleanup_orphan_manifests(cfg.destination_dir, cfg.filename_prefix);
 
-  Env src = Env::open_readonly(cfg.db_path, kMaxDbs);
-  reader_check(src.get());
+  // Also runs reader_check on the source before any read txn of ours.
+  Env src = open_env_adaptive(cfg.db_path, cfg.max_named_dbs,
+                              /*no_lock=*/false);
 
   const std::string date = current_date_string(cfg);
   const fs::path dir(cfg.destination_dir);
-  const std::string enc_final = (dir / backup_filename_for_date(date)).string();
+  const std::string enc_final =
+      (dir / backup_filename_for_date(date, cfg.filename_prefix)).string();
   const std::string enc_partial = enc_final + kPartialSuffix;
   const std::string man_final =
-      (dir / manifest_filename_for_date(date)).string();
+      (dir / manifest_filename_for_date(date, cfg.filename_prefix)).string();
   const std::string man_partial = man_final + kPartialSuffix;
 
   LWSBK_INFO("backup starting: %s -> %s", cfg.db_path.c_str(),
@@ -273,20 +357,32 @@ BackupOutcome run_backup_cycle(const Config& cfg, const SecretKey& key,
     throw;
   }
 
-  LWSBK_INFO("verify ok: %llu accounts, scan height %llu..%llu, %llu total "
-             "rows across all tables",
-             static_cast<unsigned long long>(vr.accounts.account_count),
-             static_cast<unsigned long long>(
-                 vr.accounts.scan_height_min.value_or(0)),
-             static_cast<unsigned long long>(
-                 vr.accounts.scan_height_max.value_or(0)),
-             static_cast<unsigned long long>(vr.total_rows));
+  const bool lws = vr.profile == "monero-lws";
+  if (lws)
+    LWSBK_INFO("verify ok: %llu accounts, scan height %llu..%llu, %llu total "
+               "rows across all tables",
+               static_cast<unsigned long long>(vr.accounts.account_count),
+               static_cast<unsigned long long>(
+                   vr.accounts.scan_height_min.value_or(0)),
+               static_cast<unsigned long long>(
+                   vr.accounts.scan_height_max.value_or(0)),
+               static_cast<unsigned long long>(vr.total_rows));
+  else
+    LWSBK_INFO("verify ok: generic profile, %llu named tables, %llu total "
+               "rows",
+               static_cast<unsigned long long>(vr.table_count),
+               static_cast<unsigned long long>(vr.total_rows));
 
   Manifest m;
   m.timestamp = timestamp;
-  m.account_count = vr.accounts.account_count;
-  m.scan_height_min = vr.accounts.scan_height_min;
-  m.scan_height_max = vr.accounts.scan_height_max;
+  m.profile = vr.profile;
+  if (lws) {
+    m.account_count = vr.accounts.account_count;
+    m.scan_height_min = vr.accounts.scan_height_min;
+    m.scan_height_max = vr.accounts.scan_height_max;
+  }
+  m.table_count = vr.table_count;
+  m.total_rows = vr.total_rows;
   m.sha256_of_encrypted_file = vr.sha256_hex;
   m.encrypted_size_bytes = er.ciphertext_bytes;
   m.tool_version = kToolVersion;
@@ -306,7 +402,8 @@ BackupOutcome run_backup_cycle(const Config& cfg, const SecretKey& key,
 
   // Only now — after the new backup is fully verified and durably in place —
   // is anything old allowed to be deleted.
-  int removed = apply_retention(cfg.destination_dir, cfg.retention_days, date);
+  int removed = apply_retention(cfg.destination_dir, cfg.retention_days, date,
+                                cfg.filename_prefix);
 
   BackupOutcome outcome;
   outcome.enc_path = enc_final;
