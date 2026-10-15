@@ -64,6 +64,9 @@ with a `SHA256SUMS` file:
 | x86_64 (amd64) | `lmdb-lws-backup-<version>-linux-x86_64` |
 | arm64 (aarch64) | `lmdb-lws-backup-<version>-linux-aarch64` |
 
+v0.2.0 and earlier releases carry the x86_64 binary only; the arm64 binary is
+attached from v0.2.1 on.
+
 ```bash
 # pick the asset for `uname -m`, then:
 sha256sum --ignore-missing -c SHA256SUMS
