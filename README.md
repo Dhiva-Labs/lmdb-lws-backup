@@ -74,8 +74,9 @@ sudo install -m 755 lmdb-lws-backup-<version>-linux-<arch> /usr/local/bin/lmdb-l
 The binaries are "mostly static": the C++ runtime, libsodium and LMDB are
 linked in, so the only shared dependency is glibc. CI builds and runs the
 full test suite (unit tests plus the end-to-end integration test) natively on
-both x86_64 and arm64 (Ubuntu 24.04), so the prebuilt binaries need a glibc
-at least as new as that one; on an older distribution build from source.
+both x86_64 and arm64 (Ubuntu 24.04), so the prebuilt binaries need glibc
+2.38 or newer (Ubuntu 24.04, Debian 13); on an older distribution build from
+source.
 The arm64 binary is meant for arm64 monero-lws servers (Raspberry Pi 4/5,
 Ampere and Graviton cloud instances, ...). Windows and macOS are not
 supported: the tool relies on Linux `memfd_create` and `/proc`.
