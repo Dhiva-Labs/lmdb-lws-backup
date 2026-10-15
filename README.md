@@ -1,5 +1,8 @@
 # lmdb-lws-backup
 
+[![ARM64 builds](https://github.com/Dhiva-Labs/lmdb-lws-backup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/lmdb-lws-backup/actions/workflows/ci.yml)
+![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
+
 Encrypted daily hot backups for any running LMDB environment, with a
 flagship profile for [monero-lws](https://github.com/vtnerd/monero-lws).
 Single static-leaning C++ binary + one TOML config file.
@@ -50,6 +53,34 @@ Key properties:
   `accounts_v1_by_status,id`, whose 144-byte layout is static-asserted
   against upstream `src/db/data.h`.
 
+## Download
+
+Prebuilt Linux binaries are attached to every
+[release](https://github.com/Dhiva-Labs/lmdb-lws-backup/releases), together
+with a `SHA256SUMS` file:
+
+| Machine | Asset |
+|---|---|
+| x86_64 (amd64) | `lmdb-lws-backup-<version>-linux-x86_64` |
+| arm64 (aarch64) | `lmdb-lws-backup-<version>-linux-aarch64` |
+
+```bash
+# pick the asset for `uname -m`, then:
+sha256sum --ignore-missing -c SHA256SUMS
+chmod +x lmdb-lws-backup-<version>-linux-<arch>
+sudo install -m 755 lmdb-lws-backup-<version>-linux-<arch> /usr/local/bin/lmdb-lws-backup
+```
+
+The binaries are "mostly static": the C++ runtime, libsodium and LMDB are
+linked in, so the only shared dependency is glibc. CI builds and runs the
+full test suite (unit tests plus the end-to-end integration test) natively on
+both x86_64 and arm64 (Ubuntu 24.04), so the prebuilt binaries need glibc
+2.38 or newer (Ubuntu 24.04, Debian 13); on an older distribution build from
+source.
+The arm64 binary is meant for arm64 monero-lws servers (Raspberry Pi 4/5,
+Ampere and Graviton cloud instances, ...). Windows and macOS are not
+supported: the tool relies on Linux `memfd_create` and `/proc`.
+
 ## Build
 
 Requires: gcc 10+/clang, CMake ≥ 3.16. LMDB 0.9.33 and toml++ are vendored.
@@ -63,6 +94,10 @@ cmake --build build -j"$(nproc)"
 ctest --test-dir build          # unit + integration tests
 sudo install -m 755 build/lmdb-lws-backup /usr/local/bin/
 ```
+
+The same commands build natively on x86_64 and arm64 (aarch64); nothing in
+the CMake configuration or the sources is CPU-specific, and libsodium's own
+configure script selects the implementations for the target CPU.
 
 ## Quick start
 

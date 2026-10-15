@@ -1,0 +1,146 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+            file_arch: x86-64
+            elf_machine: Advanced Micro Devices X86-64
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            file_arch: ARM aarch64
+            elf_machine: AArch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the runner is ${{ matrix.arch }}
+        run: |
+          uname -m
+          test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential cmake curl ca-certificates
+
+      # libsodium is built from the pinned tarball (scripts/fetch-libsodium.sh);
+      # the cache is per CPU architecture, the script skips the build on a hit.
+      - name: Cache static libsodium
+        uses: actions/cache@v4
+        with:
+          path: third_party/local
+          key: libsodium-${{ matrix.arch }}-${{ hashFiles('scripts/fetch-libsodium.sh', 'scripts/libsodium-*.sha256') }}
+
+      - name: Build static libsodium
+        run: ./scripts/fetch-libsodium.sh
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Test (unit + end-to-end integration)
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Verify architecture and linking
+        run: |
+          .github/scripts/verify-binary.sh build/lmdb-lws-backup \
+            third_party/local/lib/libsodium.a \
+            "${{ matrix.file_arch }}" "${{ matrix.elf_machine }}"
+
+      - name: Stage the release binary
+        env:
+          EVENT: ${{ github.event_name }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          tool_version=$(sed -n 's/.*kToolVersion\[\] = "\(.*\)";/\1/p' src/version.h)
+          cmake_version=$(sed -n 's/^project(lmdb-lws-backup VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          echo "version.h: $tool_version, CMakeLists.txt: $cmake_version"
+          test "$tool_version" = "$cmake_version"
+          if [ "$EVENT" = release ]; then
+            test "${TAG#v}" = "$tool_version" || {
+              echo "::error::release tag $TAG does not match the source version $tool_version"
+              exit 1
+            }
+          fi
+          mkdir dist
+          cp build/lmdb-lws-backup "dist/lmdb-lws-backup-${tool_version}-linux-${{ matrix.arch }}"
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lmdb-lws-backup-linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Combines both binaries with a SHA256SUMS file, so the packaging is
+  # exercised on every run, not only when a release needs it.
+  package:
+    name: release assets
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lmdb-lws-backup-linux-*
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          chmod +x lmdb-lws-backup-*
+          sha256sum lmdb-lws-backup-* > SHA256SUMS
+          cat SHA256SUMS
+          sha256sum -c SHA256SUMS
+          test "$(wc -l < SHA256SUMS)" -eq 2
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: dist/*
+          if-no-files-found: error
+
+  # Runs when a release is published (releases are made by hand). Adds the
+  # binaries that are missing from it and never replaces one that is there.
+  release:
+    name: attach to the release
+    if: github.event_name == 'release'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Upload the missing assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: .github/scripts/upload-release-assets.sh "$TAG" dist
