@@ -2,6 +2,7 @@
 
 [![ARM64 builds](https://github.com/Dhiva-Labs/lmdb-lws-backup/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Dhiva-Labs/lmdb-lws-backup/actions/workflows/ci.yml)
 ![Linux x64 | arm64](https://img.shields.io/badge/Linux-x64%20%7C%20arm64-informational?logo=linux&logoColor=white)
+![Linux: binary | rpm | Arch](https://img.shields.io/badge/Linux-binary%20%7C%20rpm%20%7C%20Arch-informational?logo=linux&logoColor=white)
 
 Encrypted daily hot backups for any running LMDB environment, with a
 flagship profile for [monero-lws](https://github.com/vtnerd/monero-lws).
@@ -83,6 +84,28 @@ source.
 The arm64 binary is meant for arm64 monero-lws servers (Raspberry Pi 4/5,
 Ampere and Graviton cloud instances, ...). Windows and macOS are not
 supported: the tool relies on Linux `memfd_create` and `/proc`.
+
+### Packages for Fedora, openSUSE and Arch
+
+From the next release on, releases also carry packages of the same
+binary. Each one is installed on its distribution by CI, which then runs a
+backup, verify, list and restore cycle with it. `<arch>` is `x86_64` or
+`aarch64`.
+
+| Distribution | File | Install |
+|---|---|---|
+| Fedora, RHEL/Rocky/Alma 10 | `lmdb-lws-backup-<version>-1.<arch>.rpm` | `sudo dnf install ./lmdb-lws-backup-<version>-1.<arch>.rpm` |
+| openSUSE Tumbleweed | the same `.rpm` | `sudo zypper install --allow-unsigned-rpm ./lmdb-lws-backup-<version>-1.<arch>.rpm` |
+| Arch Linux | `lmdb-lws-backup-<version>-1-<arch>.pkg.tar.zst` | `sudo pacman -U ./lmdb-lws-backup-<version>-1-<arch>.pkg.tar.zst` (AUR `lmdb-lws-backup-bin` once published; the recipe is `lmdb-lws-backup-bin-<version>-aur.tar.gz`) |
+
+The packages install the binary to `/usr/bin`, the three systemd units
+(disabled, pointing at `/usr/bin/lmdb-lws-backup`) to
+`/usr/lib/systemd/system`, and `config.example.toml` to
+`/usr/share/doc/lmdb-lws-backup/`. With a package, the scheduling steps
+below need no `cp` of the units: write the config and key file, then
+`sudo systemctl enable --now lmdb-lws-backup.timer`. The same glibc 2.38
+floor applies (Fedora 39 or newer, current Tumbleweed and Arch; not
+openSUSE Leap 15 or RHEL 9). The `.rpm` is unsigned.
 
 ## Build
 

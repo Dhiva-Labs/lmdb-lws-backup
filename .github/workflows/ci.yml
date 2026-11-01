@@ -121,6 +121,149 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # Packages for distributions beyond Debian/Ubuntu, from the binary the
+  # build job compiled and tested: .rpm (Fedora, RHEL, openSUSE) and
+  # .pkg.tar.zst (Arch). Each is installed on its real distribution and runs
+  # a backup, verify and restore cycle there (packaging/linux-distros/).
+  # A command-line tool gets no AppImage or Flatpak.
+  distros:
+    name: Other distros ${{ matrix.arch }}
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, deb_arch: amd64, runner: ubuntu-24.04 }
+          - { arch: aarch64, deb_arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      NFPM_VERSION: '2.48.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: lmdb-lws-backup-linux-${{ matrix.arch }}
+          path: bin
+
+      - name: Install nfpm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          case "$(uname -m)" in
+            x86_64) nfpm_arch=x86_64 ;;
+            aarch64) nfpm_arch=arm64 ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/bin"
+          cd "$RUNNER_TEMP/bin"
+          tarball="nfpm_${NFPM_VERSION}_Linux_${nfpm_arch}.tar.gz"
+          gh release download "v$NFPM_VERSION" -R goreleaser/nfpm -p "$tarball" -p checksums.txt
+          grep " $tarball\$" checksums.txt | sha256sum -c -
+          tar -xzf "$tarball" nfpm
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Build .rpm and Arch package
+        run: |
+          VERSION=$(sed -n 's/^project(lmdb-lws-backup VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          packaging/linux-distros/make-tree.sh "bin/lmdb-lws-backup-$VERSION-linux-${{ matrix.arch }}" "$RUNNER_TEMP/root"
+          VERSION="$VERSION" packaging/linux-distros/pack.sh "$RUNNER_TEMP/root" ${{ matrix.deb_arch }} dist
+
+      - name: Install and run on Fedora, openSUSE and Arch
+        run: packaging/linux-distros/verify.sh dist ${{ matrix.deb_arch }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distros-${{ matrix.arch }}
+          path: |
+            dist/*.rpm
+            dist/*.pkg.tar.zst
+          if-no-files-found: error
+
+  # AUR recipe: PKGBUILD + .SRCINFO for lmdb-lws-backup-bin, rendered with
+  # the checksums of this run's release binaries and proven with makepkg on
+  # archlinux:latest.
+  aur:
+    name: AUR PKGBUILD
+    needs: package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: assets
+
+      - name: Render and check the PKGBUILD
+        run: |
+          VERSION=$(sed -n 's/^project(lmdb-lws-backup VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          VERSION="$VERSION" packaging/arch/aur.sh \
+            "assets/lmdb-lws-backup-$VERSION-linux-x86_64" "assets/lmdb-lws-backup-$VERSION-linux-aarch64" dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aur
+          path: dist/*-aur.tar.gz
+          if-no-files-found: error
+
+  # Attaches the .rpm, Arch packages and AUR recipe to a published release.
+  # Runs on every event, so a missing file fails before a release needs it;
+  # only the upload is gated. A name already on the release is skipped, never
+  # replaced.
+  release-distros:
+    name: attach other-distro packages
+    needs: [distros, aur]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distros-*
+          merge-multiple: true
+          path: assets
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: aur
+          path: assets
+
+      - name: Check the files
+        run: |
+          v=$(sed -n 's/^project(lmdb-lws-backup VERSION \([0-9.]*\).*/\1/p' CMakeLists.txt)
+          ls -l assets
+          expected="
+          lmdb-lws-backup-$v-1.x86_64.rpm
+          lmdb-lws-backup-$v-1.aarch64.rpm
+          lmdb-lws-backup-$v-1-x86_64.pkg.tar.zst
+          lmdb-lws-backup-$v-1-aarch64.pkg.tar.zst
+          lmdb-lws-backup-bin-$v-aur.tar.gz"
+          for f in $expected; do
+            [ -f "assets/$f" ] || { echo "::error::missing assets/$f"; exit 1; }
+          done
+          [ "$(ls assets | wc -l)" -eq 5 ]
+          cd assets && sha256sum -- *
+
+      - name: Upload to the release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          existing="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')"
+          for f in assets/*; do
+            name="$(basename "$f")"
+            if printf '%s\n' "$existing" | grep -qxF -- "$name"; then
+              echo "skip $name (already on the release)"
+            else
+              gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"
+            fi
+          done
+
   # Runs when a release is published (releases are made by hand). Adds the
   # binaries that are missing from it and never replaces one that is there.
   release:
