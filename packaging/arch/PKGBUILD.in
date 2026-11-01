@@ -1,0 +1,39 @@
+# Maintainer: Dhiva Labs <dhivakar1010@gmail.com>
+#
+# AUR package. It installs the prebuilt binary from the GitHub release (the
+# one every other format ships) plus the systemd units, documentation and
+# licenses from the release tag. packaging/arch/aur.sh renders this file for
+# each release (version and checksums) and checks it with makepkg; the
+# rendered PKGBUILD and .SRCINFO are what gets pushed to the AUR.
+pkgname=@NAME@-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc='@SUMMARY@'
+arch=('x86_64' 'aarch64')
+url='@HOMEPAGE@'
+license=('@LICENSE@')
+depends=(@ARCH_DEPENDS@)
+optdepends=('curl: failure alerts to a webhook')
+provides=('@NAME@')
+conflicts=('@NAME@')
+options=('!strip' '!debug')
+_raw="https://raw.githubusercontent.com/@GITHUB_REPO@/@TAG@"
+source=(@SOURCES@)
+source_x86_64=("@NAME@-$pkgver-x86_64::@RELEASE_URL@/@NAME@-$pkgver-linux-x86_64")
+source_aarch64=("@NAME@-$pkgver-aarch64::@RELEASE_URL@/@NAME@-$pkgver-linux-aarch64")
+sha256sums=(@SHA256SUMS@)
+sha256sums_x86_64=('@SHA_X64@')
+sha256sums_aarch64=('@SHA_ARM64@')
+
+package() {
+  install -Dm755 "@NAME@-$pkgver-$CARCH" "$pkgdir/usr/bin/@NAME@"
+  # The units, installed disabled, with the packaged binary's path.
+  local unit
+  for unit in @NAME@.service @NAME@-daemon.service @NAME@.timer; do
+    install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/system/$unit"
+    sed -i 's|/usr/local/bin/@NAME@|/usr/bin/@NAME@|' "$pkgdir/usr/lib/systemd/system/$unit"
+  done
+  install -Dm644 -t "$pkgdir/usr/share/doc/@NAME@" README.md CHANGELOG.md config.example.toml
+  install -Dm644 LMDB-LICENSE LMDB-COPYRIGHT tomlplusplus-LICENSE libsodium-LICENSE \
+    -t "$pkgdir/usr/share/licenses/@NAME@"
+}
