@@ -8,6 +8,8 @@ Encrypted daily hot backups for any running LMDB environment, with a
 flagship profile for [monero-lws](https://github.com/vtnerd/monero-lws).
 Single static-leaning C++ binary + one TOML config file.
 
+**Documentation:** step-by-step guides at [learn.dhivalabs.com](https://learn.dhivalabs.com/apps/lmdb-lws-backup/): [install](https://learn.dhivalabs.com/apps/lmdb-lws-backup/install) · [beginner guide](https://learn.dhivalabs.com/apps/lmdb-lws-backup/getting-started) · [troubleshooting](https://learn.dhivalabs.com/apps/lmdb-lws-backup/faq). New to the topic? Try the [Databases](https://learn.dhivalabs.com/tracks/databases/) and [Crypto wallets](https://learn.dhivalabs.com/tracks/crypto/) learning tracks.
+
 LMDB databases routinely hold secrets, and the monero-lws database stores
 **plaintext Monero view keys**. This tool treats every backup artifact as
 exactly as sensitive as the live database: plaintext never touches
